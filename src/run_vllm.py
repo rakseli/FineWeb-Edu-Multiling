@@ -3,17 +3,18 @@ import dataclasses
 import json
 import random
 import time
-import uvloop
 import os 
 
 from typing import List, Optional, Tuple
 from transformers import AutoTokenizer
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
-from vllm.entrypoints.openai.api_server import build_async_engine_client_from_engine_args
-from vllm.utils import FlexibleArgumentParser, merge_async_iterators
-from datasets import load_dataset
+from vllm.utils import FlexibleArgumentParser
+from datasets import load_dataset,disable_caching
 from extract_scores import extract_score
 from vllm import LLM, SamplingParams
+
+disable_caching()
+
 
 n_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK",1))
 fineweb_prompt = """Below is an extract from a web page. Evaluate whether the page has a high educational
@@ -52,19 +53,21 @@ def prepare_data(args,tokenizer,max_len=1500):
     fineweb_prompt_tokenized = tokenizer(fineweb_prompt)
     fineweb_prompt_len = len(fineweb_prompt_tokenized['input_ids'])
     
-    
     def truncate(example):
-        example['text'] = example['text'][:max_len]
-        extract_tokens = tokenizer(example['text'])
-        example['extract_len']=len(extract_tokens.input_ids)
+        
+        example_len = len(example['text'])
+        example['text'] = example['text'][:min(max_len, example_len)]
+        example_tokens = tokenizer(example['text'])
+        example['extract_len']=len(example_tokens.input_ids)
         return example
     
     def add_prompt(example):
         example['text']=fineweb_prompt.format(example=example['text'])
+        example['text'] = tokenizer.apply_chat_template([{"role": "user", "content": example['text']}], tokenize=False)
         return example
 
     dataset = load_dataset("json", data_files=args.dataset,num_proc=n_cpus,split='train')
-    dataset = dataset.remove_columns(column_names=["f","o","id","filter","ts","pii", "s","rs","u","c","collection","lang","prob","seg_langs","robotstxt","dataset_source"])
+    dataset = dataset.remove_columns(column_names=["f","o","id","filter","ts","pii", "s","rs","u","c","collection","lang","prob","seg_langs","robotstxt","doc_scores"])
     dataset = dataset.map(truncate,num_proc=n_cpus)
     dataset = dataset.map(add_prompt,num_proc=n_cpus)
     dataset = dataset.add_column("promt_len", [fineweb_prompt_len] * len(dataset))
@@ -114,44 +117,11 @@ def run_vllm(dataset,sampling_params,args,engine_args: EngineArgs,use_beam_searc
         prompt_col = "prompt"
     else:
         prompt_col = "text"
-    if not use_beam_search:
-        print("Not using beam_search")
-        start = time.perf_counter()        
-        output = llm.generate(dataset[prompt_col],sampling_params, use_tqdm=True)
-        end = time.perf_counter()
-    else:
-        start = time.perf_counter()
-        llm.beam_search(
-            dataset['text'],
-            BeamSearchParams(
-                beam_width=args.n,
-                max_tokens=200,
-                ignore_eos=True,
-            ))
-        end = time.perf_counter()
+    start = time.perf_counter()        
+    output = llm.generate(dataset[prompt_col],sampling_params, use_tqdm=True)
+    end = time.perf_counter()
     elapsed_time = end - start
     return elapsed_time, output
-
-
-async def run_vllm_async(
-    dataset,
-    engine_args: AsyncEngineArgs,
-    disable_frontend_multiprocessing: bool = False,
-) -> float:
-    async with build_async_engine_client_from_engine_args(
-            engine_args, disable_frontend_multiprocessing) as llm:
-
-        generators = []
-        start = time.perf_counter()
-        for i,row in dataset:
-            generator = llm.generate(row['text'],SamplingParams.update_from_generation_config(row['sampling_params']), request_id=f"test{i}")
-            generators.append(generator)
-        all_gens = merge_async_iterators(*generators)
-        async for i, res in all_gens:
-            pass
-        end = time.perf_counter()
-        return end - start
-
 
 
 def main(args: argparse.Namespace):
@@ -167,15 +137,8 @@ def main(args: argparse.Namespace):
     else:
         dataset,sampling_params = prepare_data(args,tokenizer)
         total_num_tokens = sum(dataset["promt_len"]) + sum(dataset['extract_len'])
-    if args.async_engine:
-        elapsed_time = uvloop.run(
-            run_vllm_async(
-                dataset,
-                AsyncEngineArgs.from_cli_args(args),
-                args.disable_frontend_multiprocessing,
-            ))
-    else:
-        elapsed_time,outputs = run_vllm(dataset,sampling_params,args,
+        
+    elapsed_time,outputs = run_vllm(dataset,sampling_params,args,
                                 EngineArgs.from_cli_args(args))    
     print(f"Throughput: {len(dataset) / elapsed_time:.2f} requests/s, "
           f"{total_num_tokens / elapsed_time:.2f} total tokens/s, ")
@@ -224,11 +187,6 @@ if __name__ == "__main__":
                         default=1.0,
                         help="repetition penalty")
     parser.add_argument("--test",action="store_true")
-    parser.add_argument("--output-len",
-                        type=int,
-                        default=None,
-                        help="Output length for each request. Overrides the "
-                        "output length from the dataset.")
     parser.add_argument("--n",
                         type=int,
                         default=1,
