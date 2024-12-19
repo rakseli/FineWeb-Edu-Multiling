@@ -13,12 +13,13 @@
 module load LUMI/24.03  partition/C
 module load zstd/1.5.5-cpeGNU-24.03
 input_root=$1
+export input_root
 set -euo pipefail
 echo "Start $(date +"%Y-%-m-%d-%H:%M:%S"), folder $input_root"
 echo "Decompressing..."
-find $input_root -name "*.zst" -print0 | xargs -P $SLURM_CPUS_PER_TASK -0 -I {} zstd -d  -f {}
+find $input_root -name "*.zst" -print0 | xargs -P $SLURM_CPUS_PER_TASK -0 -I {} zstd -d -f {}
 echo "Done"
 echo "Splitting..."
 mkdir -p "$input_root/500K"
-find "$input_root/" -name "*.jsonl" -print0 | xargs -P $SLURM_CPUS_PER_TASK -I{} bash -c 'split -l 500000 "{}" "$input_root/500K/$(basename "{}" .jsonl).split.jsonl"'
+find "$input_root/" -name "*.shuf" -print0 | xargs -P $SLURM_CPUS_PER_TASK -0 -I {} bash -c 'split -l 500000 "{}" "$input_root/500K/$(basename "{}" .shuf).split.jsonl"'
 echo "End $(date +"%Y-%-m-%d-%H:%M:%S")"
