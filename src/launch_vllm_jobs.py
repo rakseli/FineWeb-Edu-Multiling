@@ -6,8 +6,8 @@ import glob
 parser = argparse.ArgumentParser()
 ap = argparse.ArgumentParser()
 ap.add_argument('--input-root',help="file to process")
-ap.add_argument('--time',help="time for processing",default="2:00:00")
-ap.add_argument('--partition',help="slurm partition",default="dev-g")
+ap.add_argument('--time',help="time for processing",default="24:00:00")
+ap.add_argument('--partition',help="slurm partition",default="standard-g")
 ap.add_argument('--rep-penalty',help="repetition penalty",default=1.0)
 ap.add_argument('--dry-run', action='store_true', help="Don't submit any jobs, just print what would be done.")
 ap.add_argument('--test', action='store_true', help="launch one test job")
@@ -40,7 +40,7 @@ def create_slurm_scripts(input_file,args):
 #SBATCH --partition={args.partition}         
 #SBATCH --nodes=1                   
 #SBATCH --ntasks-per-node=1     
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=7
 #SBATCH --gpus-per-node=4
 #SBATCH --time={args.time}
 #SBATCH --mem=480G
@@ -56,7 +56,8 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn #Only method that works on rocm atm
 export PYTHONWARNINGS=ignore #Remove annoying logs
 export VLLM_USE_TRITON_FLASH_ATTN=0 #Use Rocm version of FA
 
-
+export TRITON_HOME=/scratch/project_462000353/.triton_home
+export TRITON_CACHE_DIR=/scratch/project_462000353/.triton_cache
 #DISTRIBUTED
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export MASTER_PORT=9999
@@ -76,8 +77,8 @@ srun --label python ../src/run_vllm.py \
     --output-json ../results/hplt-annotations/vllm-throughput-{model_name}-{basename_without_suffix}-{max_seq}-rep-penalty-{args.rep_penalty}.json \
     --output-file ../results/hplt-annotations/vllm-annotations-{model_name}-{basename_without_suffix}-{max_seq}-rep-penalty-{args.rep_penalty}.jsonl \
     --max-model-len 50000 \
-    --rep-penalty {args.rep_penalty} \
-    --test
+    --rep-penalty {args.rep_penalty}
+    
 echo "End $(date +"%Y-%-m-%d-%H:%M:%S")"
 """ 
     if os.path.exists(f"../results/hplt-annotations/vllm-annotations-{model_name}-{basename_without_suffix}-{max_seq}-rep-penalty-{args.rep_penalty}.jsonl"):
@@ -85,10 +86,21 @@ echo "End $(date +"%Y-%-m-%d-%H:%M:%S")"
     return script_content
 
 if __name__ == '__main__':
+    max_jobs = 200
     args = ap.parse_args()
-    input_files = glob.glob(f"{args.input_root}/*.jsonl")
+    if os.path.isfile(args.input_root):
+        print("File given as input root, assuming the file contains paths for files...")
+        with open(args.input_file,"r") as input_file:
+            input_files = [line.strip() for line in input_file]
+    else:   
+        input_files = glob.glob(f"{args.input_root}/*.jsonl")
     job_count = 0
+    remaining_files = []
     for i,f in enumerate(input_files,start=1):
+        if job_count==max_jobs:
+            print("Max jobs have been submitted, collecting files to run into file..")
+            remaining_files.append(f)
+            continue
         command = create_slurm_scripts(f,args)
         if command is None:
             print(f"Output file for {f} already exists, skipping...")
@@ -107,5 +119,9 @@ if __name__ == '__main__':
             job_count+=1
             if args.test:
                 break
+    if remaining_files:
+        with open("files_still_missing.txt","w") as out_file:
+            for item in remaining_files:
+                out_file.write(item + '\n')     
     print(f"Launched {job_count} jobs")
     
