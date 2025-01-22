@@ -9,7 +9,7 @@ from typing import List, Optional, Tuple
 from transformers import AutoTokenizer
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.utils import FlexibleArgumentParser
-from datasets import load_dataset,disable_caching
+from datasets import load_dataset,disable_caching,Dataset
 from extract_scores import extract_score
 from vllm import LLM, SamplingParams
 
@@ -66,8 +66,21 @@ def prepare_data(args,tokenizer,max_len=1500):
         example['text'] = tokenizer.apply_chat_template([{"role": "user", "content": example['text']}], tokenize=False)
         return example
 
-    dataset = load_dataset("json", data_files=args.dataset,num_proc=n_cpus,split='train')
-    dataset = dataset.remove_columns(column_names=["f","o","id","filter","ts","pii", "s","rs","u","c","collection","lang","prob","seg_langs","robotstxt","doc_scores"])
+    if 'Llama-3' in args.model:
+        stop_tokens = ["<|end_of_text|>", "<|eot_id|>"]
+    elif 'Qwen' in args.model:
+        stop_tokens = ['<|endoftext|>']
+    else:
+        raise ValueError("Only qwen or llama3 are supported!")
+    print(f"Safe mode: {args.safe_mode}")
+    if args.safe_mode == 'true':
+        with open(args.dataset,'r',encoding='utf-8') as f:
+            data_as_json = [json.loads(line) for line in f]
+        filtered_list = [{"text": json_obj["text"]} for json_obj in data_as_json if "text" in json_obj]
+        dataset = Dataset.from_list(filtered_list)
+    else:
+        dataset = load_dataset("json", data_files=args.dataset,num_proc=n_cpus,split='train',)
+        dataset = dataset.remove_columns(column_names=["f","o","id","filter","ts","pii", "s","rs","u","c","collection","lang","prob","seg_langs","robotstxt","doc_scores"])
     dataset = dataset.map(truncate,num_proc=n_cpus)
     dataset = dataset.map(add_prompt,num_proc=n_cpus)
     dataset = dataset.add_column("promt_len", [fineweb_prompt_len] * len(dataset))
@@ -78,7 +91,7 @@ def prepare_data(args,tokenizer,max_len=1500):
                 top_p=0.95,
                 top_k=50,
                 max_tokens=1500,
-                stop=["<|end_of_text|>", "<|eot_id|>"]
+                stop=stop_tokens
             ) for i in range(len(dataset))]
     assert isinstance(sampling_params[0],SamplingParams) == True
     if args.test:
@@ -182,6 +195,9 @@ if __name__ == "__main__":
                         type=str,
                         default=None,
                         help="Path to the dataset.")
+    parser.add_argument("--safe-mode",
+                        type=str,
+                        help="use safe mode to load dataset")
     parser.add_argument("--rep-penalty",
                         type=float,
                         default=1.0,
